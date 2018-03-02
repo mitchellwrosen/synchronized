@@ -19,5 +19,3 @@ library
     , unordered-containers
   exposed-modules:
     Control.Concurrent.Synchronized
-  other-modules:
-    Control.Concurrent.Synchronized.Internal
