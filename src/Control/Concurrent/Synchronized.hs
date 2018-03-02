@@ -1,28 +1,25 @@
-{-# language DeriveGeneric   #-}
 {-# language LambdaCase      #-}
-{-# language MagicHash       #-}
+{-# language RankNTypes      #-}
 {-# language TemplateHaskell #-}
 
 module Control.Concurrent.Synchronized
   ( synchronized
   ) where
 
-import Control.Concurrent.MVar (newMVar, withMVar)
+import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Control.Concurrent.QSem (newQSem, signalQSem, waitQSem)
-import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, writeTVar)
 import Control.Exception (bracket_)
-import Data.Hashable (Hashable)
-import Data.HashMap.Strict (HashMap)
+import Data.Hashable (Hashable, hashWithSalt)
 import Data.Monoid ((<>))
-import Data.Text (Text, pack, unpack)
-import GHC.Generics (Generic)
-import GHC.Prim (unsafeCoerce#)
-import GHC.Types (Any)
+import Data.Text.Short (ShortText, fromString, toString)
 import System.IO.Unsafe (unsafePerformIO)
 
-import qualified Data.HashMap.Strict as HashMap
+import qualified Data.HashTable.IO as HashTable
 import qualified Language.Haskell.TH as TH
 import qualified Language.Haskell.TH.Syntax as TH
+
+type HashTable k v
+  = HashTable.BasicHashTable k v
 
 -- |
 -- @synchronized n action@ executes @action@, allowing at most @n@ threads to
@@ -38,61 +35,63 @@ synchronized = do
 
 synchronized_ :: FastLoc -> Int -> IO a -> IO a
 synchronized_ loc n act =
-  if n <= 1
-    then do
-      lock <-
-        lookupAny loc >>= \case
-          Nothing -> do
-            lock <- newMVar ()
-            newAny loc lock
-          Just lock ->
-            pure lock
-      withMVar lock (const act)
-    else do
-      sem <-
-        lookupAny loc >>= \case
-          Nothing -> do
-            sem <- newQSem n
-            newAny loc sem
-          Just sem ->
-            pure sem
-      bracket_ (waitQSem sem) (signalQSem sem) act
+  HashTable.lookup locksTable loc >>= \case
+    Just with ->
+      appWith with act
+    Nothing ->
+      createWith loc n >>= \with -> appWith with act
 
-locksVar :: TVar (HashMap FastLoc Any)
-locksVar =
-  unsafePerformIO (newTVarIO mempty)
-{-# NOINLINE locksVar #-}
-
-newAny :: FastLoc -> a -> IO a
-newAny loc val =
-  atomically $ do
-    locks <- readTVar locksVar
-    case HashMap.lookup loc locks of
+createWith :: FastLoc -> Int -> IO With
+createWith loc n =
+  withMVar createVar $ \_ -> do
+    HashTable.lookup locksTable loc >>= \case
       Nothing -> do
-        writeTVar locksVar (HashMap.insert loc (unsafeCoerce# val) locks)
-        pure (unsafeCoerce# val)
-      Just lock ->
-        pure (unsafeCoerce# lock)
+        with <-
+          if n <= 1
+            then do
+              lock <- newMVar ()
+              pure (With (withMVar lock . const))
+            else do
+              lock <- newQSem n
+              pure (With (bracket_ (waitQSem lock) (signalQSem lock)))
+        HashTable.insert locksTable loc with
+        pure with
+      Just with ->
+        pure with
 
-lookupAny :: FastLoc -> IO (Maybe a)
-lookupAny loc =
-  atomically (unsafeCoerce# . HashMap.lookup loc <$> readTVar locksVar)
+-- Top-level MVar that only allows one thread to insert into the global lock
+-- table at a time. This only happens on the first call to each unique
+-- 'synchronized', so there should be almost no contention.
+createVar :: MVar ()
+createVar =
+  unsafePerformIO (newMVar ())
+{-# NOINLINE createVar #-}
+
+locksTable :: HashTable FastLoc With
+locksTable =
+  unsafePerformIO HashTable.new
+{-# NOINLINE locksTable #-}
+
+newtype With
+  = With { appWith :: forall a. IO a -> IO a }
 
 -- Like 'Loc', but with a faster 'Hashable' instance.
 data FastLoc
   = FastLoc
-      {-# UNPACK #-} !Text
       {-# UNPACK #-} !Int
       {-# UNPACK #-} !Int
-  deriving (Eq, Generic, Show)
+      {-# UNPACK #-} !ShortText
+  deriving Eq
 
-instance Hashable FastLoc
+instance Hashable FastLoc where
+  hashWithSalt n (FastLoc x y s) =
+    hashWithSalt n x `hashWithSalt` y `hashWithSalt` s
 
 instance TH.Lift FastLoc where
-  lift (FastLoc s x y) =
-    [| FastLoc (pack $(TH.lift (unpack s))) x y |]
+  lift (FastLoc x y s) =
+    [| FastLoc x y (fromString $(TH.lift (toString s))) |]
 
 mkFastLoc :: TH.Loc -> FastLoc
 mkFastLoc = \case
   TH.Loc x y z (n, m) _ ->
-    FastLoc (pack x <> pack y <> pack z) n m
+    FastLoc n m (fromString x <> fromString y <> fromString z)
